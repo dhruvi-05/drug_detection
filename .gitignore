@@ -1,0 +1,30 @@
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environment
+venv/
+env/
+.venv/
+
+# Ignore Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore model and data artifacts
+*.pkl
+*.joblib
+*.csv
+*.json
+
+# But keep specific data files you need
+!Testing_User.json
+!labels.json
+
+# Ignore logs
+*.log
