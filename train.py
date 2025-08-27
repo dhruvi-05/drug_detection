@@ -1,13 +1,21 @@
-# predict.py
-import argparse
+# train.py
+import os
 import json
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
+import argparse
+
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV, train_test_split
+from sklearn.metrics import classification_report, precision_recall_fscore_support
 import joblib
+from tqdm import tqdm
+import math
+import random
 
-# thresholds (same as train.py)
+# ---------------- Config / thresholds (same as predict.py)
 EARLY_WINDOW_DAYS = 3
 EARLY_MSG_THRESHOLD = 50
 SIM_SWAP_THRESHOLD = 2
@@ -25,14 +33,16 @@ NOCTURNAL_START, NOCTURNAL_END = 0, 5
 NOCTURNAL_RATIO_THRESHOLD = 0.3
 SAME_TIME_RATIO_THRESHOLD = 0.5
 
-MODEL_PATH = "suspicion_model.pkl"
+MODEL_OUT = "suspicion_model.pkl"
+FEATURES_OUT = "features_labeled.csv"
+RANDOM_STATE = 42
 
 # ---------------- Helpers
 def safe_int(x, default=0):
     try:
         if x is None:
             return default
-        if isinstance(x, (int, float)):
+        if isinstance(x, (int, float, np.integer, np.floating)):
             return int(x)
         s = str(x).strip()
         if s == "" or s.lower() in ("none", "null"):
@@ -47,6 +57,7 @@ def parse_dt(s):
     try:
         return datetime.fromisoformat(s)
     except Exception:
+        # try common formats
         fmts = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
         for f in fmts:
             try:
@@ -66,7 +77,7 @@ def minute_of_day(dt):
 def ratio(n, d):
     return float(n) / max(1.0, float(d))
 
-# ---------------- Feature extraction (aligned with train.py)
+# ---------------- Feature extraction (same logic as predict)
 def compute_base_and_flags(user):
     meta = user.get("User_Header_Metadata", {}) or {}
     uid = meta.get("user_id") or meta.get("user_id_hash") or meta.get("userId") or meta.get("id") or None
@@ -118,17 +129,17 @@ def compute_base_and_flags(user):
     median_len = float(np.median(lengths)) if lengths else 0.0
     short_ratio = ratio(sum(1 for L in lengths if L < SHORT_MSG_LEN), total_msgs)
     long_ratio = ratio(sum(1 for L in lengths if L > LONG_MSG_LEN), total_msgs)
-    std_len = float(np.std(lengths)) if lengths else 0.0
 
     days = {m["dt"].date() for m in msgs if m["dt"]}
-    active_days = len(days) if days else 1
-    msg_rate = ratio(total_msgs, active_days)
+    active_days = len(days)
 
     nocturnal_count = sum(1 for m in msgs if m["dt"] and NOCTURNAL_START <= m["dt"].hour < NOCTURNAL_END)
     nocturnal_ratio = ratio(nocturnal_count, total_msgs)
 
     minutes = [m["minute"] for m in msgs if m["minute"] is not None]
-    mode_share = ratio(Counter(minutes).most_common(1)[0][1], len(minutes)) if minutes else 0.0
+    mode_share = 0.0
+    if minutes:
+        mode_share = ratio(Counter(minutes).most_common(1)[0][1], len(minutes))
 
     group_msgs = [m for m in msgs if m["is_group"]]
     group_high_rep = sum(1 for m in group_msgs if m.get("group_reported_count", 0) >= GROUP_REP_COUNT_HIGH)
@@ -139,21 +150,33 @@ def compute_base_and_flags(user):
         gid = m.get("group_id")
         if gid:
             names_by_gid[gid].add(m.get("group_name"))
-    group_name_changes = sum(1 for k in names_by_gid if len(names_by_gid[k]) > 1)
+    group_name_changes = sum(1 for k in names_by_gid if len([n for n in names_by_gid[k] if n]) > 1)
 
-    creation_raw = meta.get("account_creation_date") or None
+    creation_raw = meta.get("account_creation_date") or meta.get("creation_date") or None
     creation_dt = parse_dt(creation_raw) if creation_raw else None
     if creation_dt:
         creation_dt = to_ist(creation_dt)
     first_msg_dt = min([m["dt"] for m in msgs if m["dt"]], default=None)
-    start_anchor = creation_dt or first_msg_dt
+    start_anchor = None
+    if creation_dt and first_msg_dt:
+        start_anchor = min(creation_dt, first_msg_dt)
+    elif creation_dt:
+        start_anchor = creation_dt
+    elif first_msg_dt:
+        start_anchor = first_msg_dt
     early_count = 0
     if start_anchor:
         window_end = start_anchor + timedelta(days=EARLY_WINDOW_DAYS)
         early_count = sum(1 for m in msgs if m["dt"] and start_anchor <= m["dt"] <= window_end)
 
+    uniq_ips = set()
+    for m in pchats:
+        ip = m.get("sender_ip") or m.get("sender_ip_hash")
+        if ip:
+            uniq_ips.add(ip)
+    location_hops = len(uniq_ips)
+
     image_gif_ratio = ratio(total_img + total_gif, total_text)
-    reports_per_day = ratio(total_reports, active_days)
 
     flags = {
         "flag_too_many_chats_early": int(early_count > EARLY_MSG_THRESHOLD),
@@ -179,97 +202,136 @@ def compute_base_and_flags(user):
         "median_msg_len": median_len,
         "short_msg_ratio": short_ratio,
         "long_msg_ratio": long_ratio,
-        "std_msg_len": std_len,
         "nocturnal_ratio": nocturnal_ratio,
         "active_days": active_days,
         "msg_count": total_msgs,
-        "msg_rate": msg_rate,
+        "degree_centrality": 0.0,
+        "betweenness": 0.0,
+        "location_hops": location_hops,
         "image_gif_ratio": image_gif_ratio,
         "group_high_rep_ratio": group_high_rep_ratio,
         "group_name_change_count": group_name_changes,
-        "early_msg_count": early_count,
-        "reports_per_day": reports_per_day
+        "early_msg_count": early_count
     }
 
     combined = {}
     combined.update(numerics)
-    combined.update(flags)
+    combined.update({k: int(v) for k, v in flags.items()})
     combined["flag_count"] = int(sum(flags.values()))
     combined["_flags_list"] = [k for k, v in flags.items() if v]
     return combined
 
-# ---------------- Load JSON
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-# ---------------- Map features robustly
-def map_features_for_row(feature_cols, computed):
-    row = {}
-    for col in feature_cols:
-        row[col] = computed.get(col, 0)
-    return row
-
-# ---------------- Prediction
-def predict_and_rank(json_path, model_path, top_k=5, rule_threshold=6, alpha=0.6):
-    bundle = joblib.load(model_path)
-    if isinstance(bundle, dict) and "model" in bundle and "feature_cols" in bundle:
-        model = bundle["model"]
-        feature_cols = bundle["feature_cols"]
+# ---------------- Load JSON file(s)
+def load_json_records(path):
+    """
+    Accept either:
+     - a single JSON file that is a list of user objects
+     - a directory containing many JSON files (each a single user or array)
+    """
+    if os.path.isdir(path):
+        records = []
+        for fname in os.listdir(path):
+            if not fname.lower().endswith(".json"):
+                continue
+            fp = os.path.join(path, fname)
+            with open(fp, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if isinstance(d, list):
+                    records.extend(d)
+                elif isinstance(d, dict):
+                    # check if wrapped under "users" or "groups"
+                    if "users" in d:
+                        records.extend(d["users"])
+                    elif "groups" in d:
+                        for g in d["groups"]:
+                            records.extend(g.get("user_metrics", []) or [])
+                    else:
+                        records.append(d)
+        return records
     else:
-        raise RuntimeError("Model saved without feature_cols. Please retrain with updated train.py")
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            if isinstance(d, list):
+                return d
+            elif isinstance(d, dict):
+                if "users" in d:
+                    return d["users"]
+                if "groups" in d:
+                    recs = []
+                    for g in d["groups"]:
+                        recs.extend(g.get("user_metrics", []) or [])
+                    return recs
+                # fallback to values
+                return list(d.values())
+        return []
 
-    raw = load_json(json_path)
-    if isinstance(raw, dict) and "groups" in raw:
-        users = []
-        for g in raw["groups"]:
-            users.extend(g.get("user_metrics", []) or [])
-    elif isinstance(raw, list):
-        users = raw
-    else:
-        users = list(raw.values()) if isinstance(raw, dict) else []
+# ---------------- Main training pipeline
+def main(suspicious_path, normal_path, out_model=MODEL_OUT):
+    # load
+    sus = load_json_records(suspicious_path)
+    norm = load_json_records(normal_path)
+    print(f"Loaded suspicious={len(sus)}, normal={len(norm)}")
 
     rows = []
-    mapped = []
-    for u in users:
-        comp = compute_base_and_flags(u)
-        rows.append(comp)
-        mapped.append(map_features_for_row(feature_cols, comp))
+    labels = []
+    for u in tqdm(sus, desc="suspicious"):
+        rows.append(compute_base_and_flags(u))
+        labels.append(1)
+    for u in tqdm(norm, desc="normal"):
+        rows.append(compute_base_and_flags(u))
+        labels.append(0)
 
-    X = pd.DataFrame(mapped, columns=feature_cols).fillna(0).astype(float)
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X)[:, 1]
-    else:
-        proba = model.predict(X).astype(float)
+    df = pd.DataFrame(rows)
+    df["label"] = labels
 
-    out = pd.DataFrame({
-        "user_id": [r.get("user_id") for r in rows],
-        "flag_count": [r.get("flag_count", 0) for r in rows],
-        "predicted_proba": proba
-    })
+    # Save features for inspection
+    df.to_csv(FEATURES_OUT, index=False)
+    print("Saved feature CSV:", FEATURES_OUT)
 
-    max_flags = max(1, int(out["flag_count"].max()))
-    out["final_score"] = out["predicted_proba"] + alpha * (out["flag_count"] / float(max_flags))
-    out["suspicious_priority"] = out["flag_count"] >= rule_threshold
+    # Features list: use numeric + flag columns (drop meta)
+    flag_cols = [c for c in df.columns if c.startswith("flag_")]
+    numeric_cols = ["sim_swaps", "total_reports", "unique_contacts", "avg_msg_len",
+                    "median_msg_len", "short_msg_ratio", "long_msg_ratio",
+                    "nocturnal_ratio", "active_days", "msg_count", "location_hops",
+                    "image_gif_ratio", "group_high_rep_ratio", "group_name_change_count",
+                    "early_msg_count"]
+    feature_cols = [c for c in numeric_cols if c in df.columns] + flag_cols + ["flag_count"]
 
-    out = out.sort_values(by=["suspicious_priority", "final_score", "predicted_proba"],
-                          ascending=[False, False, False]).reset_index(drop=True)
+    X = df[feature_cols].fillna(0).astype(float)
+    y = df["label"].astype(int)
 
-    top = out[["user_id", "flag_count", "predicted_proba"]].head(top_k)
-    top["predicted_proba"] = top["predicted_proba"].round(6)
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, stratify=y, test_size=0.2, random_state=RANDOM_STATE)
 
-    print(f"\n🚨 Top {top_k} Most Suspicious Users 🚨")
-    print(top.to_string(index=False))
+    # Randomized search for RF hyperparams (fast)
+    clf = RandomForestClassifier(random_state=RANDOM_STATE, n_jobs=-1, class_weight="balanced")
+    param_dist = {
+        "n_estimators": [100, 200, 400],
+        "max_depth": [6, 10, 20, None],
+        "min_samples_split": [2, 4, 8],
+        "min_samples_leaf": [1, 2, 4],
+        "max_features": ["sqrt", "log2", 0.6, 0.8]
+    }
 
-    out.to_csv("predictions.csv", index=False)
-    print("\nSaved predictions.csv")
+    cv = StratifiedKFold(n_splits=4, shuffle=True, random_state=RANDOM_STATE)
+    rs = RandomizedSearchCV(clf, param_distributions=param_dist, n_iter=20, cv=cv, scoring="f1", n_jobs=-1, random_state=RANDOM_STATE, verbose=1)
+    rs.fit(X_train, y_train)
+
+    best = rs.best_estimator_
+    print("Best params:", rs.best_params_)
+
+    # Evaluate
+    y_pred = best.predict(X_test)
+    print("\nClassification report (test):")
+    print(classification_report(y_test, y_pred))
+
+    # Save model + feature_cols
+    joblib.dump({"model": best, "feature_cols": feature_cols}, out_model)
+    print("Model bundle saved to", out_model)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--file", "-f", required=True, help="testing JSON file")
-    ap.add_argument("--model", "-m", default=MODEL_PATH)
-    ap.add_argument("--topk", "-k", type=int, default=5)
-    ap.add_argument("--rule-threshold", "-r", type=int, default=6, help="flag_count threshold")
-    ap.add_argument("--alpha", type=float, default=0.6, help="weight of flags in hybrid score")
+    ap.add_argument("--suspicious", "-s", required=True, help="Path to suspicious JSON file or folder")
+    ap.add_argument("--normal", "-n", required=True, help="Path to normal JSON file or folder")
     args = ap.parse_args()
-    predict_and_rank(args.file, args.model, top_k=args.topk, rule_threshold=args.rule_threshold, alpha=args.alpha)
+    main(args.suspicious, args.normal)
